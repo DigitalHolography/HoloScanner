@@ -2,30 +2,24 @@ import csv
 import json
 import re
 import tempfile
+import zipfile
 from pathlib import Path
 from functools import lru_cache
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
 
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    HAS_DND = True
+except ImportError:
+    HAS_DND = False
 
-# ----------------------------
-# Regex patterns
-# ----------------------------
 
 HD_PATTERN = re.compile(r"(.+)_HD_(\d+)$")
 EF_PATTERN = re.compile(r"_EF_(\d+)$")
 
-
-# ----------------------------
-# Temporary cache
-# ----------------------------
-
 CACHE_FILE = Path(tempfile.gettempdir()) / "holo_scanner_cache.json"
 
-
-# ----------------------------
-# File scanning logic
-# ----------------------------
 
 class Scanner:
     def __init__(self):
@@ -33,14 +27,12 @@ class Scanner:
         self.load_cache()
 
     def load_cache(self):
-        if not CACHE_FILE.exists():
-            return
-
-        try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                self.results = json.load(f)
-        except Exception:
-            self.results = []
+        if CACHE_FILE.exists():
+            try:
+                with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                    self.results = json.load(f)
+            except Exception:
+                self.results = []
 
     def save_cache(self):
         try:
@@ -49,15 +41,36 @@ class Scanner:
         except Exception as e:
             print(f"Could not save cache: {e}")
 
-    def scan_roots(self, roots):
+    def scan_roots(self, roots, progress_callback=None):
         self.results.clear()
 
         self.find_best_hd_folder.cache_clear()
         self.find_best_ef_folder.cache_clear()
         self.find_h5_file.cache_clear()
 
+        first_level_items = []
+
         for root in roots:
-            self._scan_limited_depth(Path(root), depth=0)
+            root = Path(root)
+
+            if root.exists():
+                first_level_items.append(root)
+
+                try:
+                    for entry in root.iterdir():
+                        if entry.is_dir():
+                            first_level_items.append(entry)
+                except Exception as e:
+                    print(f"Error listing {root}: {e}")
+
+        total = max(len(first_level_items), 1)
+
+        for i, item in enumerate(first_level_items, start=1):
+            if progress_callback:
+                progress_callback(i, total, str(item))
+
+            depth = 0 if item in map(Path, roots) else 1
+            self._scan_limited_depth(item, depth=depth)
 
         self.save_cache()
 
@@ -79,7 +92,6 @@ class Scanner:
         parent = holo_path.parent
 
         hd_folder = self.find_best_hd_folder(parent, base_name)
-
         ef_folder = None
         h5_file = None
 
@@ -157,19 +169,16 @@ class Scanner:
         return None
 
 
-# ----------------------------
-# GUI
-# ----------------------------
-
 class App:
     def __init__(self, root):
         self.root = root
         self.root.title("Holo Scanner")
-        self.root.geometry("1100x650")
+        self.root.geometry("1150x720")
 
         self.scanner = Scanner()
         self.folders = []
         self.filtered_results = []
+        self.holo_or_patterns = []
 
         self.filter_vars = {
             "holo": tk.StringVar(),
@@ -188,9 +197,26 @@ class App:
         tk.Button(top, text="Add Folder", command=self.add_folder).pack(side="left")
         tk.Button(top, text="Scan", command=self.scan).pack(side="left")
         tk.Button(top, text="Export CSV + TXT", command=self.export).pack(side="left")
+        tk.Button(top, text="Export H5 ZIP", command=self.export_h5_zip).pack(side="left")
+        tk.Button(top, text="Load regex TXT", command=self.load_regex_txt).pack(side="left")
 
         self.folder_list = tk.Listbox(self.root, height=4)
         self.folder_list.pack(fill="x", padx=5, pady=5)
+
+        regex_frame = tk.Frame(self.root)
+        regex_frame.pack(fill="x", padx=5, pady=3)
+
+        self.regex_drop_label = tk.Label(
+            regex_frame,
+            text="Drop regex TXT here to filter HOLO paths with OR logic",
+            relief="groove",
+            height=2,
+        )
+        self.regex_drop_label.pack(fill="x")
+
+        if HAS_DND:
+            self.regex_drop_label.drop_target_register(DND_FILES)
+            self.regex_drop_label.dnd_bind("<<Drop>>", self.on_regex_file_drop)
 
         filter_frame = tk.Frame(self.root)
         filter_frame.pack(fill="x", padx=5)
@@ -205,16 +231,24 @@ class App:
             entry.pack(fill="x")
             entry.bind("<KeyRelease>", lambda event: self.refresh_table())
 
+        progress_frame = tk.Frame(self.root)
+        progress_frame.pack(fill="x", padx=5, pady=5)
+
+        self.progress = ttk.Progressbar(progress_frame, orient="horizontal", mode="determinate")
+        self.progress.pack(fill="x", side="left", expand=True)
+
+        self.progress_label = tk.Label(progress_frame, text="")
+        self.progress_label.pack(side="left", padx=8)
+
         table_frame = tk.Frame(self.root)
         table_frame.pack(fill="both", expand=True, padx=5, pady=5)
 
         columns = ("holo", "hd", "ef", "h5")
-
         self.tree = ttk.Treeview(table_frame, columns=columns, show="headings")
 
         for col in columns:
             self.tree.heading(col, text=col.upper())
-            self.tree.column(col, width=260)
+            self.tree.column(col, width=270)
 
         scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscroll=scrollbar.set)
@@ -233,7 +267,18 @@ class App:
             messagebox.showwarning("Warning", "No folders selected")
             return
 
-        self.scanner.scan_roots(self.folders)
+        self.progress["value"] = 0
+        self.progress_label.config(text="Scanning...")
+
+        def update_progress(i, total, current_path):
+            self.progress["maximum"] = total
+            self.progress["value"] = i
+            self.progress_label.config(text=f"{i}/{total}")
+            self.root.update_idletasks()
+
+        self.scanner.scan_roots(self.folders, progress_callback=update_progress)
+
+        self.progress_label.config(text="Done")
         self.refresh_table()
 
     def row_matches_filters(self, row):
@@ -246,6 +291,20 @@ class App:
                 if not re.search(pattern, row[col], flags=re.IGNORECASE):
                     return False
             except re.error:
+                return False
+
+        if self.holo_or_patterns:
+            matched = False
+
+            for pattern in self.holo_or_patterns:
+                try:
+                    if re.search(pattern, row["holo"], flags=re.IGNORECASE):
+                        matched = True
+                        break
+                except re.error:
+                    continue
+
+            if not matched:
                 return False
 
         return True
@@ -265,6 +324,43 @@ class App:
                 r["ef"],
                 r["h5"],
             ))
+
+    def load_regex_txt(self):
+        file = filedialog.askopenfilename(
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+
+        if file:
+            self.load_regex_patterns_from_file(file)
+
+    def on_regex_file_drop(self, event):
+        files = self.root.tk.splitlist(event.data)
+        if files:
+            self.load_regex_patterns_from_file(files[0])
+
+    def load_regex_patterns_from_file(self, file):
+        path = Path(file)
+
+        if not path.exists():
+            messagebox.showerror("Error", f"File does not exist:\n{path}")
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                self.holo_or_patterns = [
+                    line.strip()
+                    for line in f
+                    if line.strip() and not line.strip().startswith("#")
+                ]
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not read regex file:\n{e}")
+            return
+
+        self.regex_drop_label.config(
+            text=f"Loaded {len(self.holo_or_patterns)} HOLO regex patterns from {path.name}"
+        )
+
+        self.refresh_table()
 
     def export(self):
         if not self.filtered_results:
@@ -298,22 +394,43 @@ class App:
                     if r[col]:
                         f.write(r[col] + "\n")
 
-        messagebox.showinfo(
-            "Success",
-            "Export completed:\n"
-            f"{csv_path}\n"
-            f"{txt_paths['holo']}\n"
-            f"{txt_paths['hd']}\n"
-            f"{txt_paths['ef']}\n"
-            f"{txt_paths['h5']}"
-        )
+        messagebox.showinfo("Success", "CSV and TXT export completed")
 
+    def export_h5_zip(self):
+        h5_paths = []
 
-# ----------------------------
-# Run app
-# ----------------------------
+        for r in self.filtered_results:
+            h5 = r.get("h5", "")
+            if h5 and Path(h5).exists():
+                h5_paths.append(Path(h5))
+
+        if not h5_paths:
+            messagebox.showwarning("Warning", "No H5 files to export")
+            return
+
+        zip_file = filedialog.asksaveasfilename(defaultextension=".zip")
+        if not zip_file:
+            return
+
+        zip_path = Path(zip_file)
+
+        try:
+            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                for i, h5_path in enumerate(h5_paths):
+                    arcname = f"{i:05d}_{h5_path.name}"
+                    z.write(h5_path, arcname=arcname)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not create ZIP:\n{e}")
+            return
+
+        messagebox.showinfo("Success", f"Exported {len(h5_paths)} H5 files to ZIP")
+
 
 if __name__ == "__main__":
-    root = tk.Tk()
+    if HAS_DND:
+        root = TkinterDnD.Tk()
+    else:
+        root = tk.Tk()
+
     app = App(root)
     root.mainloop()
