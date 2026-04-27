@@ -1,0 +1,16 @@
+[project]
+name = "holo-scanner"
+version = "0.1.0"
+description = "Small Tkinter GUI for scanning .holo, HD, EF, and H5 files."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+holo-scanner = "holo_scanner:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["holo_scanner"]

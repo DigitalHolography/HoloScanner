@@ -541,8 +541,7 @@ class App:
             var.set("")
         self.holo_or_patterns.clear()
 
-
-if __name__ == "__main__":
+def main():
     if HAS_DND:
         root = TkinterDnD.Tk()
     else:
@@ -550,3 +549,6 @@ if __name__ == "__main__":
 
     app = App(root)
     root.mainloop()
+
+if __name__ == "__main__":
+    main()
