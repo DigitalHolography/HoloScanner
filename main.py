@@ -221,9 +221,15 @@ class Scanner:
         if not folder:
             return ""
 
-        version_file = Path(folder) / "version.txt"
+        version_file = next(
+            (
+                p for p in Path(folder).glob("*version.txt")
+                if not p.name.endswith("_git_version.txt")
+            ),
+            None,
+        )
 
-        if not version_file.exists():
+        if not version_file or not version_file.exists():
             return ""
 
         try:
@@ -233,6 +239,21 @@ class Scanner:
             ).strip()
         except Exception:
             return ""
+        
+    def clear_cache(self):
+        self.results.clear()
+
+        if CACHE_FILE.exists():
+            try:
+                CACHE_FILE.unlink()
+            except Exception as e:
+                print(f"Could not delete cache: {e}")
+
+        # also clear function-level caches
+        self.find_best_hd_folder.cache_clear()
+        self.find_best_ef_folder.cache_clear()
+        self.find_h5_file.cache_clear()
+        self.read_version_txt.cache_clear()
 
 
 class App:
@@ -264,6 +285,7 @@ class App:
         tk.Button(top, text="Export H5 ZIP", command=self.export_h5_zip).pack(side="left")
         tk.Button(top, text="Load regex TXT", command=self.load_regex_txt).pack(side="left")
         tk.Button(top, text="Clear regex TXT", command=self.clear_regex_txt).pack(side="left")
+        tk.Button(top, text="Clear Cache", command=self.clear_cache).pack(side="left")
 
         self.folder_list = tk.Listbox(self.root, height=4)
         self.folder_list.pack(fill="x", padx=5, pady=5)
@@ -507,6 +529,17 @@ class App:
             return
 
         messagebox.showinfo("Success", f"Exported {len(h5_paths)} H5 files to ZIP")
+        
+    def clear_cache(self):
+        if not messagebox.askyesno("Confirm", "Clear cache and results?"):
+            return
+
+        self.scanner.clear_cache()
+        self.refresh_table()
+        self.status_label.config(text="Cache cleared")
+        for var in self.filter_vars.values():
+            var.set("")
+        self.holo_or_patterns.clear()
 
 
 if __name__ == "__main__":
