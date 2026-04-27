@@ -17,8 +17,54 @@ except ImportError:
 
 HD_PATTERN = re.compile(r"(.+)_HD_(\d+)$")
 EF_PATTERN = re.compile(r"_EF_(\d+)$")
-
 CACHE_FILE = Path(tempfile.gettempdir()) / "holo_scanner_cache.json"
+
+COLUMNS = ("holo", "hd", "hd_version", "ef", "ef_version", "h5")
+
+
+class ProgressDialog:
+    def __init__(self, parent):
+        self.parent = parent
+        self.window = tk.Toplevel(parent)
+        self.window.title("Scanning")
+        self.window.geometry("520x120")
+        self.window.transient(parent)
+        self.window.grab_set()
+
+        self.label = tk.Label(self.window, text="Starting scan...")
+        self.label.pack(fill="x", padx=12, pady=(12, 4))
+
+        self.path_label = tk.Label(self.window, text="", anchor="w")
+        self.path_label.pack(fill="x", padx=12)
+
+        self.progress = ttk.Progressbar(self.window, mode="indeterminate")
+        self.progress.pack(fill="x", padx=12, pady=12)
+
+        self.window.update_idletasks()
+
+    def set_indeterminate(self, text):
+        self.label.config(text=text)
+        self.progress.config(mode="indeterminate")
+        self.progress.start(10)
+        self.parent.update_idletasks()
+
+    def set_determinate(self, text, maximum):
+        self.progress.stop()
+        self.label.config(text=text)
+        self.progress.config(mode="determinate", maximum=max(maximum, 1), value=0)
+        self.parent.update_idletasks()
+
+    def update(self, value, maximum, path=""):
+        self.progress["maximum"] = max(maximum, 1)
+        self.progress["value"] = value
+        self.label.config(text=f"Processing {value}/{maximum}")
+        self.path_label.config(text=path)
+        self.parent.update_idletasks()
+
+    def close(self):
+        self.progress.stop()
+        self.window.grab_release()
+        self.window.destroy()
 
 
 class Scanner:
@@ -27,63 +73,60 @@ class Scanner:
         self.load_cache()
 
     def load_cache(self):
-        if CACHE_FILE.exists():
-            try:
-                with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                    self.results = json.load(f)
-            except Exception:
-                self.results = []
+        if not CACHE_FILE.exists():
+            return
+
+        try:
+            self.results = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            self.results = []
 
     def save_cache(self):
         try:
-            with open(CACHE_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.results, f, indent=2)
+            CACHE_FILE.write_text(
+                json.dumps(self.results, indent=2),
+                encoding="utf-8",
+            )
         except Exception as e:
             print(f"Could not save cache: {e}")
 
-    def scan_roots(self, roots, progress_callback=None):
+    def scan_roots(self, roots, progress=None):
         self.results.clear()
 
         self.find_best_hd_folder.cache_clear()
         self.find_best_ef_folder.cache_clear()
         self.find_h5_file.cache_clear()
+        self.read_version_txt.cache_clear()
 
-        first_level_items = []
+        if progress:
+            progress.set_indeterminate("Finding .holo files...")
+
+        holo_files = []
 
         for root in roots:
-            root = Path(root)
+            self._collect_holo_files(Path(root), depth=0, holo_files=holo_files)
 
-            if root.exists():
-                first_level_items.append(root)
+        if progress:
+            progress.set_determinate("Processing .holo files...", len(holo_files))
 
-                try:
-                    for entry in root.iterdir():
-                        if entry.is_dir():
-                            first_level_items.append(entry)
-                except Exception as e:
-                    print(f"Error listing {root}: {e}")
+        for i, holo_path in enumerate(holo_files, start=1):
+            self.process_holo(holo_path)
 
-        total = max(len(first_level_items), 1)
-
-        for i, item in enumerate(first_level_items, start=1):
-            if progress_callback:
-                progress_callback(i, total, str(item))
-
-            depth = 0 if item in map(Path, roots) else 1
-            self._scan_limited_depth(item, depth=depth)
+            if progress:
+                progress.update(i, len(holo_files), str(holo_path))
 
         self.save_cache()
 
-    def _scan_limited_depth(self, path, depth):
+    def _collect_holo_files(self, path, depth, holo_files):
         if depth > 2:
             return
 
         try:
             for entry in path.iterdir():
                 if entry.is_file() and entry.suffix.lower() == ".holo":
-                    self.process_holo(entry)
+                    holo_files.append(entry)
                 elif entry.is_dir():
-                    self._scan_limited_depth(entry, depth + 1)
+                    self._collect_holo_files(entry, depth + 1, holo_files)
         except Exception as e:
             print(f"Error occurred while scanning {path}: {e}")
 
@@ -92,6 +135,7 @@ class Scanner:
         parent = holo_path.parent
 
         hd_folder = self.find_best_hd_folder(parent, base_name)
+
         ef_folder = None
         h5_file = None
 
@@ -103,7 +147,9 @@ class Scanner:
         self.results.append({
             "holo": str(holo_path),
             "hd": str(hd_folder) if hd_folder else "",
+            "hd_version": self.read_version_txt(hd_folder) if hd_folder else "",
             "ef": str(ef_folder) if ef_folder else "",
+            "ef_version": self.read_version_txt(ef_folder) if ef_folder else "",
             "h5": str(h5_file) if h5_file else "",
         })
 
@@ -130,7 +176,8 @@ class Scanner:
 
     @lru_cache(maxsize=None)
     def find_best_ef_folder(self, hd_folder):
-        eyeflow = hd_folder / "eyeflow"
+        eyeflow = Path(hd_folder) / "eyeflow"
+
         if not eyeflow.exists():
             return None
 
@@ -155,7 +202,8 @@ class Scanner:
 
     @lru_cache(maxsize=None)
     def find_h5_file(self, ef_folder):
-        h5_dir = ef_folder / "h5"
+        h5_dir = Path(ef_folder) / "h5"
+
         if not h5_dir.exists():
             return None
 
@@ -168,12 +216,30 @@ class Scanner:
 
         return None
 
+    @lru_cache(maxsize=None)
+    def read_version_txt(self, folder):
+        if not folder:
+            return ""
+
+        version_file = Path(folder) / "version.txt"
+
+        if not version_file.exists():
+            return ""
+
+        try:
+            return version_file.read_text(
+                encoding="utf-8",
+                errors="replace",
+            ).strip()
+        except Exception:
+            return ""
+
 
 class App:
     def __init__(self, root):
         self.root = root
         self.root.title("Holo Scanner")
-        self.root.geometry("1150x720")
+        self.root.geometry("1300x760")
 
         self.scanner = Scanner()
         self.folders = []
@@ -181,10 +247,8 @@ class App:
         self.holo_or_patterns = []
 
         self.filter_vars = {
-            "holo": tk.StringVar(),
-            "hd": tk.StringVar(),
-            "ef": tk.StringVar(),
-            "h5": tk.StringVar(),
+            col: tk.StringVar()
+            for col in COLUMNS
         }
 
         self.setup_ui()
@@ -199,6 +263,7 @@ class App:
         tk.Button(top, text="Export CSV + TXT", command=self.export).pack(side="left")
         tk.Button(top, text="Export H5 ZIP", command=self.export_h5_zip).pack(side="left")
         tk.Button(top, text="Load regex TXT", command=self.load_regex_txt).pack(side="left")
+        tk.Button(top, text="Clear regex TXT", command=self.clear_regex_txt).pack(side="left")
 
         self.folder_list = tk.Listbox(self.root, height=4)
         self.folder_list.pack(fill="x", padx=5, pady=5)
@@ -221,7 +286,7 @@ class App:
         filter_frame = tk.Frame(self.root)
         filter_frame.pack(fill="x", padx=5)
 
-        for col in ("holo", "hd", "ef", "h5"):
+        for col in COLUMNS:
             box = tk.Frame(filter_frame)
             box.pack(side="left", fill="x", expand=True, padx=2)
 
@@ -231,33 +296,39 @@ class App:
             entry.pack(fill="x")
             entry.bind("<KeyRelease>", lambda event: self.refresh_table())
 
-        progress_frame = tk.Frame(self.root)
-        progress_frame.pack(fill="x", padx=5, pady=5)
+        status_frame = tk.Frame(self.root)
+        status_frame.pack(fill="x", padx=5, pady=3)
 
-        self.progress = ttk.Progressbar(progress_frame, orient="horizontal", mode="determinate")
-        self.progress.pack(fill="x", side="left", expand=True)
-
-        self.progress_label = tk.Label(progress_frame, text="")
-        self.progress_label.pack(side="left", padx=8)
+        self.status_label = tk.Label(status_frame, text="")
+        self.status_label.pack(anchor="w")
 
         table_frame = tk.Frame(self.root)
         table_frame.pack(fill="both", expand=True, padx=5, pady=5)
 
-        columns = ("holo", "hd", "ef", "h5")
-        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings")
+        self.tree = ttk.Treeview(table_frame, columns=COLUMNS, show="headings")
 
-        for col in columns:
+        for col in COLUMNS:
             self.tree.heading(col, text=col.upper())
-            self.tree.column(col, width=270)
+            self.tree.column(col, width=210)
 
-        scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscroll=scrollbar.set)
+        scrollbar_y = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        scrollbar_x = ttk.Scrollbar(table_frame, orient="horizontal", command=self.tree.xview)
 
-        self.tree.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        self.tree.configure(
+            yscrollcommand=scrollbar_y.set,
+            xscrollcommand=scrollbar_x.set,
+        )
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar_y.grid(row=0, column=1, sticky="ns")
+        scrollbar_x.grid(row=1, column=0, sticky="ew")
+
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
 
     def add_folder(self):
         folder = filedialog.askdirectory()
+
         if folder:
             self.folders.append(folder)
             self.folder_list.insert(tk.END, folder)
@@ -267,45 +338,37 @@ class App:
             messagebox.showwarning("Warning", "No folders selected")
             return
 
-        self.progress["value"] = 0
-        self.progress_label.config(text="Scanning...")
+        progress = ProgressDialog(self.root)
 
-        def update_progress(i, total, current_path):
-            self.progress["maximum"] = total
-            self.progress["value"] = i
-            self.progress_label.config(text=f"{i}/{total}")
-            self.root.update_idletasks()
+        try:
+            self.scanner.scan_roots(self.folders, progress=progress)
+        finally:
+            progress.close()
 
-        self.scanner.scan_roots(self.folders, progress_callback=update_progress)
-
-        self.progress_label.config(text="Done")
         self.refresh_table()
 
     def row_matches_filters(self, row):
         for col, var in self.filter_vars.items():
             pattern = var.get().strip()
+
             if not pattern:
                 continue
 
             try:
-                if not re.search(pattern, row[col], flags=re.IGNORECASE):
+                if not re.search(pattern, row.get(col, ""), flags=re.IGNORECASE):
                     return False
             except re.error:
                 return False
 
         if self.holo_or_patterns:
-            matched = False
-
             for pattern in self.holo_or_patterns:
                 try:
-                    if re.search(pattern, row["holo"], flags=re.IGNORECASE):
-                        matched = True
-                        break
+                    if re.search(pattern, row.get("holo", ""), flags=re.IGNORECASE):
+                        return True
                 except re.error:
                     continue
 
-            if not matched:
-                return False
+            return False
 
         return True
 
@@ -318,12 +381,15 @@ class App:
         ]
 
         for r in self.filtered_results:
-            self.tree.insert("", "end", values=(
-                r["holo"],
-                r["hd"],
-                r["ef"],
-                r["h5"],
-            ))
+            self.tree.insert(
+                "",
+                "end",
+                values=tuple(r.get(col, "") for col in COLUMNS),
+            )
+
+        self.status_label.config(
+            text=f"Showing {len(self.filtered_results)} / {len(self.scanner.results)} rows"
+        )
 
     def load_regex_txt(self):
         file = filedialog.askopenfilename(
@@ -335,6 +401,7 @@ class App:
 
     def on_regex_file_drop(self, event):
         files = self.root.tk.splitlist(event.data)
+
         if files:
             self.load_regex_patterns_from_file(files[0])
 
@@ -346,12 +413,11 @@ class App:
             return
 
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                self.holo_or_patterns = [
-                    line.strip()
-                    for line in f
-                    if line.strip() and not line.strip().startswith("#")
-                ]
+            self.holo_or_patterns = [
+                line.strip()
+                for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            ]
         except Exception as e:
             messagebox.showerror("Error", f"Could not read regex file:\n{e}")
             return
@@ -362,12 +428,20 @@ class App:
 
         self.refresh_table()
 
+    def clear_regex_txt(self):
+        self.holo_or_patterns.clear()
+        self.regex_drop_label.config(
+            text="Drop regex TXT here to filter HOLO paths with OR logic"
+        )
+        self.refresh_table()
+
     def export(self):
         if not self.filtered_results:
             messagebox.showwarning("Warning", "No data to export")
             return
 
         csv_file = filedialog.asksaveasfilename(defaultextension=".csv")
+
         if not csv_file:
             return
 
@@ -375,24 +449,23 @@ class App:
         stem = csv_path.with_suffix("")
 
         txt_paths = {
-            "holo": Path(f"{stem}_holo.txt"),
-            "hd": Path(f"{stem}_hd.txt"),
-            "ef": Path(f"{stem}_ef.txt"),
-            "h5": Path(f"{stem}_h5.txt"),
+            col: Path(f"{stem}_{col}.txt")
+            for col in COLUMNS
         }
 
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["holo", "hd", "ef", "h5"])
+            writer.writerow(COLUMNS)
 
             for r in self.filtered_results:
-                writer.writerow([r["holo"], r["hd"], r["ef"], r["h5"]])
+                writer.writerow([r.get(col, "") for col in COLUMNS])
 
         for col, path in txt_paths.items():
             with open(path, "w", encoding="utf-8") as f:
                 for r in self.filtered_results:
-                    if r[col]:
-                        f.write(r[col] + "\n")
+                    value = r.get(col, "")
+                    if value:
+                        f.write(value + "\n")
 
         messagebox.showinfo("Success", "CSV and TXT export completed")
 
@@ -401,6 +474,7 @@ class App:
 
         for r in self.filtered_results:
             h5 = r.get("h5", "")
+
             if h5 and Path(h5).exists():
                 h5_paths.append(Path(h5))
 
@@ -409,6 +483,7 @@ class App:
             return
 
         zip_file = filedialog.asksaveasfilename(defaultextension=".zip")
+
         if not zip_file:
             return
 
@@ -416,9 +491,17 @@ class App:
 
         try:
             with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                used_names = set()
+
                 for i, h5_path in enumerate(h5_paths):
                     arcname = f"{i:05d}_{h5_path.name}"
+
+                    while arcname in used_names:
+                        arcname = f"{i:05d}_{h5_path.stem}_duplicate{h5_path.suffix}"
+
+                    used_names.add(arcname)
                     z.write(h5_path, arcname=arcname)
+
         except Exception as e:
             messagebox.showerror("Error", f"Could not create ZIP:\n{e}")
             return
