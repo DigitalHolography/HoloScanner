@@ -1,7 +1,10 @@
 import csv
 import json
+import queue
 import re
 import tempfile
+import threading
+import time
 import zipfile
 from pathlib import Path
 from functools import lru_cache
@@ -21,13 +24,24 @@ CACHE_FILE = Path(tempfile.gettempdir()) / "holo_scanner_cache.json"
 
 COLUMNS = ("holo", "hd", "hd_version", "ef", "ef_version", "h5")
 
+SUB_LEVEL_SCANNING = 2
+
+EXCLUDED_STR = [
+    "HD", # Do not look holo for files in HD folders
+    "EF", # Do not look holo for files in EF folders
+    # Example:
+    # "backup",
+    # "old",
+    # "tmp",
+]
+
 
 class ProgressDialog:
     def __init__(self, parent):
         self.parent = parent
         self.window = tk.Toplevel(parent)
         self.window.title("Scanning")
-        self.window.geometry("520x120")
+        self.window.geometry("520x140")
         self.window.transient(parent)
         self.window.grab_set()
 
@@ -36,6 +50,9 @@ class ProgressDialog:
 
         self.path_label = tk.Label(self.window, text="", anchor="w")
         self.path_label.pack(fill="x", padx=12)
+
+        self.timer_label = tk.Label(self.window, text="Elapsed: 0.0 s", anchor="w")
+        self.timer_label.pack(fill="x", padx=12)
 
         self.progress = ttk.Progressbar(self.window, mode="indeterminate")
         self.progress.pack(fill="x", padx=12, pady=12)
@@ -46,20 +63,23 @@ class ProgressDialog:
         self.label.config(text=text)
         self.progress.config(mode="indeterminate")
         self.progress.start(10)
-        self.parent.update_idletasks()
 
     def set_determinate(self, text, maximum):
         self.progress.stop()
         self.label.config(text=text)
         self.progress.config(mode="determinate", maximum=max(maximum, 1), value=0)
-        self.parent.update_idletasks()
 
-    def update(self, value, maximum, path=""):
+    def update_found(self, count, path, elapsed):
+        self.label.config(text=f"Finding .holo files... found {count}")
+        self.path_label.config(text=path)
+        self.timer_label.config(text=f"Elapsed: {elapsed:.1f} s")
+
+    def update_processing(self, value, maximum, path, elapsed):
         self.progress["maximum"] = max(maximum, 1)
         self.progress["value"] = value
         self.label.config(text=f"Processing {value}/{maximum}")
         self.path_label.config(text=path)
-        self.parent.update_idletasks()
+        self.timer_label.config(text=f"Elapsed: {elapsed:.1f} s")
 
     def close(self):
         self.progress.stop()
@@ -90,7 +110,7 @@ class Scanner:
         except Exception as e:
             print(f"Could not save cache: {e}")
 
-    def scan_roots(self, roots, progress=None):
+    def scan_roots(self, roots, progress_callback=None):
         self.results.clear()
 
         self.find_best_hd_folder.cache_clear()
@@ -98,35 +118,91 @@ class Scanner:
         self.find_h5_file.cache_clear()
         self.read_version_txt.cache_clear()
 
-        if progress:
-            progress.set_indeterminate("Finding .holo files...")
+        start_time = time.perf_counter()
+
+        if progress_callback:
+            progress_callback({
+                "type": "finding_start",
+                "elapsed": 0.0,
+            })
 
         holo_files = []
 
         for root in roots:
-            self._collect_holo_files(Path(root), depth=0, holo_files=holo_files)
+            self._collect_holo_files(
+                Path(root),
+                depth=0,
+                holo_files=holo_files,
+                progress_callback=progress_callback,
+                start_time=start_time,
+            )
 
-        if progress:
-            progress.set_determinate("Processing .holo files...", len(holo_files))
+        if progress_callback:
+            progress_callback({
+                "type": "processing_start",
+                "maximum": len(holo_files),
+                "elapsed": time.perf_counter() - start_time,
+            })
 
         for i, holo_path in enumerate(holo_files, start=1):
             self.process_holo(holo_path)
 
-            if progress:
-                progress.update(i, len(holo_files), str(holo_path))
+            if progress_callback:
+                progress_callback({
+                    "type": "processing",
+                    "value": i,
+                    "maximum": len(holo_files),
+                    "path": str(holo_path),
+                    "elapsed": time.perf_counter() - start_time,
+                })
 
         self.save_cache()
 
-    def _collect_holo_files(self, path, depth, holo_files):
-        if depth > 2:
+        if progress_callback:
+            progress_callback({
+                "type": "done",
+                "elapsed": time.perf_counter() - start_time,
+            })
+
+    def _collect_holo_files(
+        self,
+        path,
+        depth,
+        holo_files,
+        progress_callback=None,
+        start_time=None,
+    ):
+        if depth > SUB_LEVEL_SCANNING:
             return
+
+        path_str = str(path).lower()
+
+        for excluded in EXCLUDED_STR:
+            if excluded.lower() in path_str:
+                return
 
         try:
             for entry in path.iterdir():
                 if entry.is_file() and entry.suffix.lower() == ".holo":
                     holo_files.append(entry)
+
+                    if progress_callback:
+                        progress_callback({
+                            "type": "found_holo",
+                            "count": len(holo_files),
+                            "path": str(entry),
+                            "elapsed": time.perf_counter() - start_time,
+                        })
+
                 elif entry.is_dir():
-                    self._collect_holo_files(entry, depth + 1, holo_files)
+                    self._collect_holo_files(
+                        entry,
+                        depth + 1,
+                        holo_files,
+                        progress_callback=progress_callback,
+                        start_time=start_time,
+                    )
+
         except Exception as e:
             print(f"Error occurred while scanning {path}: {e}")
 
@@ -239,7 +315,7 @@ class Scanner:
             ).strip()
         except Exception:
             return ""
-        
+
     def clear_cache(self):
         self.results.clear()
 
@@ -249,7 +325,6 @@ class Scanner:
             except Exception as e:
                 print(f"Could not delete cache: {e}")
 
-        # also clear function-level caches
         self.find_best_hd_folder.cache_clear()
         self.find_best_ef_folder.cache_clear()
         self.find_h5_file.cache_clear()
@@ -266,6 +341,10 @@ class App:
         self.folders = []
         self.filtered_results = []
         self.holo_or_patterns = []
+
+        self.scan_running = False
+        self.scan_queue = None
+        self.scan_progress = None
 
         self.filter_vars = {
             col: tk.StringVar()
@@ -360,14 +439,104 @@ class App:
             messagebox.showwarning("Warning", "No folders selected")
             return
 
-        progress = ProgressDialog(self.root)
+        if self.scan_running:
+            messagebox.showwarning("Warning", "Scan already running")
+            return
 
-        try:
-            self.scanner.scan_roots(self.folders, progress=progress)
-        finally:
-            progress.close()
+        self.scan_running = True
+        self.scan_queue = queue.Queue()
+        self.scan_progress = ProgressDialog(self.root)
 
-        self.refresh_table()
+        def progress_callback(event):
+            self.scan_queue.put(event)
+
+        def worker():
+            try:
+                self.scanner.scan_roots(
+                    self.folders,
+                    progress_callback=progress_callback,
+                )
+            except Exception as e:
+                self.scan_queue.put({
+                    "type": "error",
+                    "error": str(e),
+                })
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+        self.root.after(50, self.poll_scan_queue)
+
+    def poll_scan_queue(self):
+        finished = False
+        error = None
+        elapsed = 0.0
+
+        while True:
+            try:
+                event = self.scan_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            event_type = event.get("type")
+            elapsed = event.get("elapsed", elapsed)
+
+            if event_type == "finding_start":
+                self.scan_progress.set_indeterminate("Finding .holo files...")
+
+            elif event_type == "found_holo":
+                self.scan_progress.update_found(
+                    event.get("count", 0),
+                    event.get("path", ""),
+                    event.get("elapsed", 0.0),
+                )
+
+            elif event_type == "processing_start":
+                self.scan_progress.set_determinate(
+                    "Processing .holo files...",
+                    event.get("maximum", 0),
+                )
+
+            elif event_type == "processing":
+                self.scan_progress.update_processing(
+                    event.get("value", 0),
+                    event.get("maximum", 0),
+                    event.get("path", ""),
+                    event.get("elapsed", 0.0),
+                )
+
+            elif event_type == "done":
+                finished = True
+                elapsed = event.get("elapsed", 0.0)
+
+            elif event_type == "error":
+                finished = True
+                error = event.get("error", "Unknown error")
+
+        if finished:
+            self.scan_running = False
+
+            if self.scan_progress:
+                self.scan_progress.close()
+                self.scan_progress = None
+
+            if error:
+                messagebox.showerror("Error", f"Scan failed:\n{error}")
+                return
+
+            self.refresh_table()
+
+            self.status_label.config(
+                text=(
+                    f"Scan completed in {elapsed:.2f} s. "
+                    f"Showing {len(self.filtered_results)} / {len(self.scanner.results)} rows"
+                )
+            )
+
+            messagebox.showinfo("Success", f"Scan completed in {elapsed:.2f} s")
+            return
+
+        self.root.after(50, self.poll_scan_queue)
 
     def row_matches_filters(self, row):
         for col, var in self.filter_vars.items():
@@ -529,7 +698,7 @@ class App:
             return
 
         messagebox.showinfo("Success", f"Exported {len(h5_paths)} H5 files to ZIP")
-        
+
     def clear_cache(self):
         if not messagebox.askyesno("Confirm", "Clear cache and results?"):
             return
@@ -537,9 +706,15 @@ class App:
         self.scanner.clear_cache()
         self.refresh_table()
         self.status_label.config(text="Cache cleared")
+
         for var in self.filter_vars.values():
             var.set("")
+
         self.holo_or_patterns.clear()
+        self.regex_drop_label.config(
+            text="Drop regex TXT here to filter HOLO paths with OR logic"
+        )
+
 
 def main():
     if HAS_DND:
@@ -547,8 +722,9 @@ def main():
     else:
         root = tk.Tk()
 
-    app = App(root)
+    App(root)
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()
