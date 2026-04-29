@@ -5,8 +5,13 @@ description = "Small Tkinter GUI for scanning .holo, HD, EF, and H5 files."
 requires-python = ">=3.10"
 dependencies = []
 
+[project.optional-dependencies]
+build = [
+    "pyinstaller>=6.0",
+]
+
 [project.scripts]
-holo-scanner = "holo_scanner:main"
+holoscanner = "holo_scanner:main"
 
 [build-system]
 requires = ["setuptools>=68"]
