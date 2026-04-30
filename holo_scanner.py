@@ -27,25 +27,21 @@ COLUMNS = ("holo", "hd", "hd_version", "ef", "ef_version", "h5")
 SUB_LEVEL_SCANNING = 2
 
 EXCLUDED_STR = [
-    "HD", # Do not look holo for files in HD folders
-    "EF", # Do not look holo for files in EF folders
-    # Example:
-    # "backup",
-    # "old",
-    # "tmp",
+    "HD",  # Do not look for .holo files in HD folders
+    "EF",  # Do not look for .holo files in EF folders
 ]
 
 
 class ProgressDialog:
-    def __init__(self, parent):
+    def __init__(self, parent, title, initial_text):
         self.parent = parent
         self.window = tk.Toplevel(parent)
-        self.window.title("Scanning")
-        self.window.geometry("520x140")
+        self.window.title(title)
+        self.window.geometry("560x150")
         self.window.transient(parent)
         self.window.grab_set()
 
-        self.label = tk.Label(self.window, text="Starting scan...")
+        self.label = tk.Label(self.window, text=initial_text, anchor="w")
         self.label.pack(fill="x", padx=12, pady=(12, 4))
 
         self.path_label = tk.Label(self.window, text="", anchor="w")
@@ -60,24 +56,30 @@ class ProgressDialog:
         self.window.update_idletasks()
 
     def set_indeterminate(self, text):
+        self.progress.stop()
         self.label.config(text=text)
+        self.path_label.config(text="")
         self.progress.config(mode="indeterminate")
         self.progress.start(10)
 
     def set_determinate(self, text, maximum):
         self.progress.stop()
         self.label.config(text=text)
-        self.progress.config(mode="determinate", maximum=max(maximum, 1), value=0)
+        self.progress.config(
+            mode="determinate",
+            maximum=max(maximum, 1),
+            value=0,
+        )
 
-    def update_found(self, count, path, elapsed):
-        self.label.config(text=f"Finding .holo files... found {count}")
+    def update_progress(self, text, value, maximum, path="", elapsed=0.0):
+        self.progress["maximum"] = max(maximum, 1)
+        self.progress["value"] = value
+        self.label.config(text=text)
         self.path_label.config(text=path)
         self.timer_label.config(text=f"Elapsed: {elapsed:.1f} s")
 
-    def update_processing(self, value, maximum, path, elapsed):
-        self.progress["maximum"] = max(maximum, 1)
-        self.progress["value"] = value
-        self.label.config(text=f"Processing {value}/{maximum}")
+    def update_status(self, text, path="", elapsed=0.0):
+        self.label.config(text=text)
         self.path_label.config(text=path)
         self.timer_label.config(text=f"Elapsed: {elapsed:.1f} s")
 
@@ -122,7 +124,7 @@ class Scanner:
 
         if progress_callback:
             progress_callback({
-                "type": "finding_start",
+                "type": "scan_finding_start",
                 "elapsed": 0.0,
             })
 
@@ -139,7 +141,7 @@ class Scanner:
 
         if progress_callback:
             progress_callback({
-                "type": "processing_start",
+                "type": "scan_processing_start",
                 "maximum": len(holo_files),
                 "elapsed": time.perf_counter() - start_time,
             })
@@ -149,7 +151,7 @@ class Scanner:
 
             if progress_callback:
                 progress_callback({
-                    "type": "processing",
+                    "type": "scan_processing",
                     "value": i,
                     "maximum": len(holo_files),
                     "path": str(holo_path),
@@ -160,7 +162,7 @@ class Scanner:
 
         if progress_callback:
             progress_callback({
-                "type": "done",
+                "type": "scan_done",
                 "elapsed": time.perf_counter() - start_time,
             })
 
@@ -188,7 +190,7 @@ class Scanner:
 
                     if progress_callback:
                         progress_callback({
-                            "type": "found_holo",
+                            "type": "scan_found_holo",
                             "count": len(holo_files),
                             "path": str(entry),
                             "elapsed": time.perf_counter() - start_time,
@@ -217,6 +219,7 @@ class Scanner:
 
         if hd_folder:
             ef_folder = self.find_best_ef_folder(hd_folder)
+
             if ef_folder:
                 h5_file = self.find_h5_file(ef_folder)
 
@@ -240,11 +243,14 @@ class Scanner:
                     continue
 
                 match = HD_PATTERN.match(d.name)
+
                 if match and match.group(1) == base_name:
                     num = int(match.group(2))
+
                     if num > best_num:
                         best_num = num
                         best = d
+
         except PermissionError:
             pass
 
@@ -266,11 +272,14 @@ class Scanner:
                     continue
 
                 match = EF_PATTERN.search(d.name)
+
                 if match:
                     num = int(match.group(1))
+
                     if num > best_num:
                         best_num = num
                         best = d
+
         except PermissionError:
             pass
 
@@ -287,6 +296,7 @@ class Scanner:
             for f in h5_dir.iterdir():
                 if f.is_file() and f.suffix.lower() == ".h5":
                     return f
+
         except PermissionError:
             pass
 
@@ -313,6 +323,7 @@ class Scanner:
                 encoding="utf-8",
                 errors="replace",
             ).strip()
+
         except Exception:
             return ""
 
@@ -345,6 +356,10 @@ class App:
         self.scan_running = False
         self.scan_queue = None
         self.scan_progress = None
+
+        self.export_running = False
+        self.export_queue = None
+        self.export_progress = None
 
         self.filter_vars = {
             col: tk.StringVar()
@@ -446,7 +461,11 @@ class App:
 
         self.scan_running = True
         self.scan_queue = queue.Queue()
-        self.scan_progress = ProgressDialog(self.root)
+        self.scan_progress = ProgressDialog(
+            self.root,
+            title="Scanning",
+            initial_text="Preparing scan...",
+        )
 
         def progress_callback(event):
             self.scan_queue.put(event)
@@ -457,9 +476,10 @@ class App:
                     self.folders,
                     progress_callback=progress_callback,
                 )
+
             except Exception as e:
                 self.scan_queue.put({
-                    "type": "error",
+                    "type": "scan_error",
                     "error": str(e),
                 })
 
@@ -482,35 +502,39 @@ class App:
             event_type = event.get("type")
             elapsed = event.get("elapsed", elapsed)
 
-            if event_type == "finding_start":
+            if event_type == "scan_finding_start":
                 self.scan_progress.set_indeterminate("Finding .holo files...")
 
-            elif event_type == "found_holo":
-                self.scan_progress.update_found(
-                    event.get("count", 0),
-                    event.get("path", ""),
-                    event.get("elapsed", 0.0),
+            elif event_type == "scan_found_holo":
+                self.scan_progress.update_status(
+                    text=f"Finding .holo files... found {event.get('count', 0)}",
+                    path=event.get("path", ""),
+                    elapsed=event.get("elapsed", 0.0),
                 )
 
-            elif event_type == "processing_start":
+            elif event_type == "scan_processing_start":
                 self.scan_progress.set_determinate(
-                    "Processing .holo files...",
-                    event.get("maximum", 0),
+                    text="Processing .holo files...",
+                    maximum=event.get("maximum", 0),
                 )
 
-            elif event_type == "processing":
-                self.scan_progress.update_processing(
-                    event.get("value", 0),
-                    event.get("maximum", 0),
-                    event.get("path", ""),
-                    event.get("elapsed", 0.0),
+            elif event_type == "scan_processing":
+                value = event.get("value", 0)
+                maximum = event.get("maximum", 0)
+
+                self.scan_progress.update_progress(
+                    text=f"Processing .holo files {value}/{maximum}",
+                    value=value,
+                    maximum=maximum,
+                    path=event.get("path", ""),
+                    elapsed=event.get("elapsed", 0.0),
                 )
 
-            elif event_type == "done":
+            elif event_type == "scan_done":
                 finished = True
                 elapsed = event.get("elapsed", 0.0)
 
-            elif event_type == "error":
+            elif event_type == "scan_error":
                 finished = True
                 error = event.get("error", "Unknown error")
 
@@ -549,6 +573,7 @@ class App:
             try:
                 if not re.search(pattern, row.get(col, ""), flags=re.IGNORECASE):
                     return False
+
             except re.error:
                 return False
 
@@ -557,6 +582,7 @@ class App:
                 try:
                     if re.search(pattern, row.get("holo", ""), flags=re.IGNORECASE):
                         return True
+
                 except re.error:
                     continue
 
@@ -607,9 +633,13 @@ class App:
         try:
             self.holo_or_patterns = [
                 line.strip()
-                for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
+                for line in path.read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                ).splitlines()
                 if line.strip() and not line.strip().startswith("#")
             ]
+
         except Exception as e:
             messagebox.showerror("Error", f"Could not read regex file:\n{e}")
             return
@@ -656,6 +686,7 @@ class App:
             with open(path, "w", encoding="utf-8") as f:
                 for r in self.filtered_results:
                     value = r.get(col, "")
+
                     if value:
                         f.write(value + "\n")
 
@@ -664,18 +695,14 @@ class App:
     def export_h5_zip(self):
         self.export_zip_worker(
             kind="H5",
-            extension=".h5",
             collect_paths=self.collect_h5_paths,
         )
-
 
     def export_pdf_zip(self):
         self.export_zip_worker(
             kind="PDF",
-            extension=".pdf",
             collect_paths=self.collect_pdf_paths,
         )
-
 
     def collect_h5_paths(self):
         paths = []
@@ -687,7 +714,6 @@ class App:
                 paths.append(Path(h5))
 
         return paths
-
 
     def collect_pdf_paths(self):
         paths = []
@@ -713,16 +739,9 @@ class App:
 
         return paths
 
-
-    def export_zip_worker(self, kind, extension, collect_paths):
-        if getattr(self, "export_running", False):
+    def export_zip_worker(self, kind, collect_paths):
+        if self.export_running:
             messagebox.showwarning("Warning", "Export already running")
-            return
-
-        paths = collect_paths()
-
-        if not paths:
-            messagebox.showwarning("Warning", f"No {kind} files to export")
             return
 
         zip_file = filedialog.asksaveasfilename(
@@ -735,48 +754,71 @@ class App:
 
         self.export_running = True
         self.export_queue = queue.Queue()
-        self.export_progress = ProgressDialog(self.root)
+        self.export_progress = ProgressDialog(
+            self.root,
+            title=f"Exporting {kind} ZIP",
+            initial_text=f"Preparing {kind} export...",
+        )
 
         zip_path = Path(zip_file)
+        start_time = time.perf_counter()
+
+        self.export_progress.set_indeterminate(f"Finding {kind} files...")
 
         def worker():
             try:
+                paths = collect_paths()
+
+                if not paths:
+                    self.export_queue.put({
+                        "type": "export_empty",
+                        "kind": kind,
+                        "elapsed": time.perf_counter() - start_time,
+                    })
+                    return
+
+                self.export_queue.put({
+                    "type": "export_start",
+                    "kind": kind,
+                    "maximum": len(paths),
+                    "elapsed": time.perf_counter() - start_time,
+                })
+
                 with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
                     used_names = set()
                     total = len(paths)
 
                     for i, path in enumerate(paths, start=1):
-                        arcname = f"{i - 1:05d}_{path.name}"
+                        arcname = self.make_unique_arcname(
+                            index=i - 1,
+                            path=path,
+                            used_names=used_names,
+                        )
 
-                        duplicate_index = 1
-                        while arcname in used_names:
-                            arcname = (
-                                f"{i - 1:05d}_{path.stem}_duplicate"
-                                f"{duplicate_index}{path.suffix}"
-                            )
-                            duplicate_index += 1
-
-                        used_names.add(arcname)
                         z.write(path, arcname=arcname)
 
                         self.export_queue.put({
-                            "type": "progress",
-                            "current": i,
-                            "total": total,
-                            "message": f"Exporting {kind} file {i}/{total}",
+                            "type": "export_progress",
+                            "kind": kind,
+                            "value": i,
+                            "maximum": total,
+                            "path": str(path),
+                            "elapsed": time.perf_counter() - start_time,
                         })
 
                 self.export_queue.put({
-                    "type": "done",
-                    "count": len(paths),
+                    "type": "export_done",
                     "kind": kind,
+                    "count": len(paths),
                     "zip_path": str(zip_path),
+                    "elapsed": time.perf_counter() - start_time,
                 })
 
             except Exception as e:
                 self.export_queue.put({
-                    "type": "error",
+                    "type": "export_error",
                     "error": str(e),
+                    "elapsed": time.perf_counter() - start_time,
                 })
 
         thread = threading.Thread(target=worker, daemon=True)
@@ -784,55 +826,91 @@ class App:
 
         self.root.after(50, self.poll_export_queue)
 
+    def make_unique_arcname(self, index, path, used_names):
+        arcname = f"{index:05d}_{path.name}"
+        duplicate_index = 1
+
+        while arcname in used_names:
+            arcname = (
+                f"{index:05d}_{path.stem}_duplicate"
+                f"{duplicate_index}{path.suffix}"
+            )
+            duplicate_index += 1
+
+        used_names.add(arcname)
+        return arcname
 
     def poll_export_queue(self):
-        try:
-            while True:
+        finished = False
+        error = None
+        done_event = None
+
+        while True:
+            try:
                 event = self.export_queue.get_nowait()
+            except queue.Empty:
+                break
 
-                if event["type"] == "progress":
-                    current = event["current"]
-                    total = event["total"]
-                    message = event["message"]
+            event_type = event.get("type")
 
-                    if hasattr(self.export_progress, "label"):
-                        self.export_progress.label.config(text=message)
+            if event_type == "export_progress":
+                value = event.get("value", 0)
+                maximum = event.get("maximum", 0)
+                kind = event.get("kind", "files")
 
-                    if hasattr(self.export_progress, "progress"):
-                        self.export_progress.progress["maximum"] = total
-                        self.export_progress.progress["value"] = current
+                self.export_progress.update_progress(
+                    text=f"Exporting {kind} files {value}/{maximum}",
+                    value=value,
+                    maximum=maximum,
+                    path=event.get("path", ""),
+                    elapsed=event.get("elapsed", 0.0),
+                )
+            elif event_type == "export_empty":
+                finished = True
+                error = f"No {event.get('kind', '')} files to export"
 
-                elif event["type"] == "done":
-                    self.export_running = False
+            elif event_type == "export_start":
+                self.export_progress.set_determinate(
+                    text=f"Exporting {event.get('kind', '')} files...",
+                    maximum=event.get("maximum", 0),
+                )
 
-                    if self.export_progress:
-                        self.export_progress.window.destroy()
-                        self.export_progress = None
+            elif event_type == "export_done":
+                finished = True
+                done_event = event
 
-                    messagebox.showinfo(
-                        "Success",
-                        f"Exported {event['count']} {event['kind']} files to ZIP",
-                    )
-                    return
+            elif event_type == "export_error":
+                finished = True
+                error = event.get("error", "Unknown error")
 
-                elif event["type"] == "error":
-                    self.export_running = False
+        if finished:
+            self.export_running = False
 
-                    if self.export_progress:
-                        self.export_progress.window.destroy()
-                        self.export_progress = None
+            if self.export_progress:
+                self.export_progress.close()
+                self.export_progress = None
 
-                    messagebox.showerror(
-                        "Error",
-                        f"Could not create ZIP:\n{event['error']}",
-                    )
-                    return
+            if error:
+                messagebox.showerror("Error", f"Could not create ZIP:\n{error}")
+                return
 
-        except queue.Empty:
-            pass
+            self.status_label.config(
+                text=(
+                    f"{done_event['kind']} ZIP export completed in "
+                    f"{done_event['elapsed']:.2f} s"
+                )
+            )
 
-        if self.export_running:
-            self.root.after(50, self.poll_export_queue)
+            messagebox.showinfo(
+                "Success",
+                (
+                    f"Exported {done_event['count']} {done_event['kind']} files "
+                    f"to ZIP in {done_event['elapsed']:.2f} s"
+                ),
+            )
+            return
+
+        self.root.after(50, self.poll_export_queue)
 
     def clear_cache(self):
         if not messagebox.askyesno("Confirm", "Clear cache and results?"):
