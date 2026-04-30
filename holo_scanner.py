@@ -1,9 +1,8 @@
 import csv
 import json
-import os
+import logging
 import queue
 import re
-import tempfile
 import threading
 import time
 import zipfile
@@ -12,6 +11,8 @@ from functools import lru_cache
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
 
+import settings
+
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
     HAS_DND = True
@@ -19,32 +20,10 @@ except ImportError:
     HAS_DND = False
 
 
+LOGGER = logging.getLogger(__name__)
+
 HD_PATTERN = re.compile(r"(.+)_HD_(\d+)$")
 EF_PATTERN = re.compile(r"_EF_(\d+)$")
-APP_NAME = "HoloScanner"
-
-
-def get_app_data_dir():
-    appdata = os.environ.get("APPDATA")
-
-    if appdata:
-        return Path(appdata) / APP_NAME
-
-    return Path.home() / "AppData" / "Roaming" / APP_NAME
-
-
-APP_DATA_DIR = get_app_data_dir()
-LOG_DIR = APP_DATA_DIR / "logs"
-CACHE_FILE = APP_DATA_DIR / "holo_scanner_cache.json"
-LEGACY_CACHE_FILE = Path(tempfile.gettempdir()) / "holo_scanner_cache.json"
-
-
-def ensure_app_data_dirs():
-    try:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        print(f"Could not create app data directory: {e}")
-
 
 COLUMNS = ("holo", "hd", "hd_version", "ef", "ef_version", "h5")
 
@@ -54,6 +33,35 @@ EXCLUDED_STR = [
     "HD",  # Do not look for .holo files in HD folders
     "EF",  # Do not look for .holo files in EF folders
 ]
+
+
+def configure_logging():
+    settings.ensure_app_data_dirs()
+    log_path = settings.get_default_log_path()
+
+    logging.basicConfig(
+        filename=log_path,
+        filemode="w",
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        encoding="utf-8",
+        force=True,
+    )
+
+    LOGGER.info(
+        "HoloScanner started (version: %s)",
+        settings.app_version() or "unknown",
+    )
+    LOGGER.info("Cache file: %s", settings.get_default_cache_file())
+    LOGGER.info("Log file: %s", log_path)
+    return log_path
+
+
+def log_tkinter_exception(exc_type, exc_value, exc_traceback):
+    LOGGER.exception(
+        "Unhandled Tkinter callback exception",
+        exc_info=(exc_type, exc_value, exc_traceback),
+    )
 
 
 class ProgressDialog:
@@ -119,36 +127,32 @@ class Scanner:
         self.load_cache()
 
     def load_cache(self):
-        cache_file = CACHE_FILE
-
-        if not cache_file.exists() and LEGACY_CACHE_FILE.exists():
-            cache_file = LEGACY_CACHE_FILE
+        cache_file = settings.get_default_cache_file()
 
         if not cache_file.exists():
             return
 
         try:
             self.results = json.loads(cache_file.read_text(encoding="utf-8"))
+            LOGGER.info("Loaded %s cached rows from %s", len(self.results), cache_file)
         except Exception:
+            LOGGER.exception("Could not load cache from %s", cache_file)
             self.results = []
             return
 
-        if cache_file == LEGACY_CACHE_FILE and self.save_cache():
-            try:
-                LEGACY_CACHE_FILE.unlink()
-            except Exception:
-                pass
-
     def save_cache(self):
+        cache_file = settings.get_default_cache_file()
+
         try:
-            APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-            CACHE_FILE.write_text(
+            settings.ensure_app_data_dirs()
+            cache_file.write_text(
                 json.dumps(self.results, indent=2),
                 encoding="utf-8",
             )
+            LOGGER.info("Saved %s cached rows to %s", len(self.results), cache_file)
             return True
-        except Exception as e:
-            print(f"Could not save cache: {e}")
+        except Exception:
+            LOGGER.exception("Could not save cache to %s", cache_file)
             return False
 
     def scan_roots(self, roots, progress_callback=None):
@@ -244,8 +248,8 @@ class Scanner:
                         start_time=start_time,
                     )
 
-        except Exception as e:
-            print(f"Error occurred while scanning {path}: {e}")
+        except Exception:
+            LOGGER.exception("Error occurred while scanning %s", path)
 
     def process_holo(self, holo_path):
         base_name = holo_path.stem
@@ -369,14 +373,14 @@ class Scanner:
     def clear_cache(self):
         self.results.clear()
 
-        for cache_file in (CACHE_FILE, LEGACY_CACHE_FILE):
-            if not cache_file.exists():
-                continue
+        cache_file = settings.get_default_cache_file()
 
+        if cache_file.exists():
             try:
                 cache_file.unlink()
-            except Exception as e:
-                print(f"Could not delete cache: {e}")
+                LOGGER.info("Deleted cache file %s", cache_file)
+            except Exception:
+                LOGGER.exception("Could not delete cache file %s", cache_file)
 
         self.find_best_hd_folder.cache_clear()
         self.find_best_ef_folder.cache_clear()
@@ -520,6 +524,7 @@ class App:
                 )
 
             except Exception as e:
+                LOGGER.exception("Scan failed")
                 self.scan_queue.put({
                     "type": "scan_error",
                     "error": str(e),
@@ -683,6 +688,7 @@ class App:
             ]
 
         except Exception as e:
+            LOGGER.exception("Could not read regex file %s", path)
             messagebox.showerror("Error", f"Could not read regex file:\n{e}")
             return
 
@@ -855,8 +861,15 @@ class App:
                     "zip_path": str(zip_path),
                     "elapsed": time.perf_counter() - start_time,
                 })
+                LOGGER.info(
+                    "Exported %s %s files to %s",
+                    len(paths),
+                    kind,
+                    zip_path,
+                )
 
             except Exception as e:
+                LOGGER.exception("Could not create %s ZIP at %s", kind, zip_path)
                 self.export_queue.put({
                     "type": "export_error",
                     "error": str(e),
@@ -972,13 +985,14 @@ class App:
 
 
 def main():
-    ensure_app_data_dirs()
+    configure_logging()
 
     if HAS_DND:
         root = TkinterDnD.Tk()
     else:
         root = tk.Tk()
 
+    root.report_callback_exception = log_tkinter_exception
     App(root)
     root.mainloop()
 

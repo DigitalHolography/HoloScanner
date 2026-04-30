@@ -241,7 +241,7 @@ def _write_inno_script(app_version: str) -> Path:
 
         [Dirs]
         Name: "{{userappdata}}\\{{#AppName}}"; Flags: uninsneveruninstall
-        Name: "{{userappdata}}\\{{#AppName}}\\logs"; Flags: uninsneveruninstall
+        Name: "{{userappdata}}\\{{#AppName}}\\{{#AppVersion}}"; Flags: uninsneveruninstall
 
         [Files]
         Source: "{{#PayloadDir}}\\*"; DestDir: "{{app}}"; Flags: ignoreversion recursesubdirs createallsubdirs
