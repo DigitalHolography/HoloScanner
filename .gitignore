@@ -1,5 +1,5 @@
 /venv
-/__pycache__
+__pycache__/
 /holo_scanner.egg-info
 /dist
 /build

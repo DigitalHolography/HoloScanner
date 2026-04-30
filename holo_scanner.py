@@ -1,5 +1,6 @@
 import csv
 import json
+import os
 import queue
 import re
 import tempfile
@@ -20,7 +21,30 @@ except ImportError:
 
 HD_PATTERN = re.compile(r"(.+)_HD_(\d+)$")
 EF_PATTERN = re.compile(r"_EF_(\d+)$")
-CACHE_FILE = Path(tempfile.gettempdir()) / "holo_scanner_cache.json"
+APP_NAME = "HoloScanner"
+
+
+def get_app_data_dir():
+    appdata = os.environ.get("APPDATA")
+
+    if appdata:
+        return Path(appdata) / APP_NAME
+
+    return Path.home() / "AppData" / "Roaming" / APP_NAME
+
+
+APP_DATA_DIR = get_app_data_dir()
+LOG_DIR = APP_DATA_DIR / "logs"
+CACHE_FILE = APP_DATA_DIR / "holo_scanner_cache.json"
+LEGACY_CACHE_FILE = Path(tempfile.gettempdir()) / "holo_scanner_cache.json"
+
+
+def ensure_app_data_dirs():
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"Could not create app data directory: {e}")
+
 
 COLUMNS = ("holo", "hd", "hd_version", "ef", "ef_version", "h5")
 
@@ -95,22 +119,37 @@ class Scanner:
         self.load_cache()
 
     def load_cache(self):
-        if not CACHE_FILE.exists():
+        cache_file = CACHE_FILE
+
+        if not cache_file.exists() and LEGACY_CACHE_FILE.exists():
+            cache_file = LEGACY_CACHE_FILE
+
+        if not cache_file.exists():
             return
 
         try:
-            self.results = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+            self.results = json.loads(cache_file.read_text(encoding="utf-8"))
         except Exception:
             self.results = []
+            return
+
+        if cache_file == LEGACY_CACHE_FILE and self.save_cache():
+            try:
+                LEGACY_CACHE_FILE.unlink()
+            except Exception:
+                pass
 
     def save_cache(self):
         try:
+            APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
             CACHE_FILE.write_text(
                 json.dumps(self.results, indent=2),
                 encoding="utf-8",
             )
+            return True
         except Exception as e:
             print(f"Could not save cache: {e}")
+            return False
 
     def scan_roots(self, roots, progress_callback=None):
         self.results.clear()
@@ -330,9 +369,12 @@ class Scanner:
     def clear_cache(self):
         self.results.clear()
 
-        if CACHE_FILE.exists():
+        for cache_file in (CACHE_FILE, LEGACY_CACHE_FILE):
+            if not cache_file.exists():
+                continue
+
             try:
-                CACHE_FILE.unlink()
+                cache_file.unlink()
             except Exception as e:
                 print(f"Could not delete cache: {e}")
 
@@ -930,6 +972,8 @@ class App:
 
 
 def main():
+    ensure_app_data_dirs()
+
     if HAS_DND:
         root = TkinterDnD.Tk()
     else:
