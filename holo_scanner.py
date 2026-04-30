@@ -362,6 +362,7 @@ class App:
         tk.Button(top, text="Scan", command=self.scan).pack(side="left")
         tk.Button(top, text="Export CSV + TXT", command=self.export).pack(side="left")
         tk.Button(top, text="Export H5 ZIP", command=self.export_h5_zip).pack(side="left")
+        tk.Button(top, text="Export PDF ZIP", command=self.export_pdf_zip).pack(side="left")
         tk.Button(top, text="Load regex TXT", command=self.load_regex_txt).pack(side="left")
         tk.Button(top, text="Clear regex TXT", command=self.clear_regex_txt).pack(side="left")
         tk.Button(top, text="Clear Cache", command=self.clear_cache).pack(side="left")
@@ -661,43 +662,177 @@ class App:
         messagebox.showinfo("Success", "CSV and TXT export completed")
 
     def export_h5_zip(self):
-        h5_paths = []
+        self.export_zip_worker(
+            kind="H5",
+            extension=".h5",
+            collect_paths=self.collect_h5_paths,
+        )
+
+
+    def export_pdf_zip(self):
+        self.export_zip_worker(
+            kind="PDF",
+            extension=".pdf",
+            collect_paths=self.collect_pdf_paths,
+        )
+
+
+    def collect_h5_paths(self):
+        paths = []
 
         for r in self.filtered_results:
             h5 = r.get("h5", "")
 
             if h5 and Path(h5).exists():
-                h5_paths.append(Path(h5))
+                paths.append(Path(h5))
 
-        if not h5_paths:
-            messagebox.showwarning("Warning", "No H5 files to export")
+        return paths
+
+
+    def collect_pdf_paths(self):
+        paths = []
+
+        for r in self.filtered_results:
+            ef = r.get("ef", "")
+
+            if not ef:
+                continue
+
+            pdf_dir = Path(ef) / "pdf"
+
+            if not pdf_dir.exists():
+                continue
+
+            pdf_path = next(
+                (p for p in pdf_dir.glob("*.pdf") if p.is_file()),
+                None,
+            )
+
+            if pdf_path is not None:
+                paths.append(pdf_path)
+
+        return paths
+
+
+    def export_zip_worker(self, kind, extension, collect_paths):
+        if getattr(self, "export_running", False):
+            messagebox.showwarning("Warning", "Export already running")
             return
 
-        zip_file = filedialog.asksaveasfilename(defaultextension=".zip")
+        paths = collect_paths()
+
+        if not paths:
+            messagebox.showwarning("Warning", f"No {kind} files to export")
+            return
+
+        zip_file = filedialog.asksaveasfilename(
+            defaultextension=".zip",
+            filetypes=[("ZIP files", "*.zip"), ("All files", "*.*")],
+        )
 
         if not zip_file:
             return
 
+        self.export_running = True
+        self.export_queue = queue.Queue()
+        self.export_progress = ProgressDialog(self.root)
+
         zip_path = Path(zip_file)
 
+        def worker():
+            try:
+                with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                    used_names = set()
+                    total = len(paths)
+
+                    for i, path in enumerate(paths, start=1):
+                        arcname = f"{i - 1:05d}_{path.name}"
+
+                        duplicate_index = 1
+                        while arcname in used_names:
+                            arcname = (
+                                f"{i - 1:05d}_{path.stem}_duplicate"
+                                f"{duplicate_index}{path.suffix}"
+                            )
+                            duplicate_index += 1
+
+                        used_names.add(arcname)
+                        z.write(path, arcname=arcname)
+
+                        self.export_queue.put({
+                            "type": "progress",
+                            "current": i,
+                            "total": total,
+                            "message": f"Exporting {kind} file {i}/{total}",
+                        })
+
+                self.export_queue.put({
+                    "type": "done",
+                    "count": len(paths),
+                    "kind": kind,
+                    "zip_path": str(zip_path),
+                })
+
+            except Exception as e:
+                self.export_queue.put({
+                    "type": "error",
+                    "error": str(e),
+                })
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+        self.root.after(50, self.poll_export_queue)
+
+
+    def poll_export_queue(self):
         try:
-            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-                used_names = set()
+            while True:
+                event = self.export_queue.get_nowait()
 
-                for i, h5_path in enumerate(h5_paths):
-                    arcname = f"{i:05d}_{h5_path.name}"
+                if event["type"] == "progress":
+                    current = event["current"]
+                    total = event["total"]
+                    message = event["message"]
 
-                    while arcname in used_names:
-                        arcname = f"{i:05d}_{h5_path.stem}_duplicate{h5_path.suffix}"
+                    if hasattr(self.export_progress, "label"):
+                        self.export_progress.label.config(text=message)
 
-                    used_names.add(arcname)
-                    z.write(h5_path, arcname=arcname)
+                    if hasattr(self.export_progress, "progress"):
+                        self.export_progress.progress["maximum"] = total
+                        self.export_progress.progress["value"] = current
 
-        except Exception as e:
-            messagebox.showerror("Error", f"Could not create ZIP:\n{e}")
-            return
+                elif event["type"] == "done":
+                    self.export_running = False
 
-        messagebox.showinfo("Success", f"Exported {len(h5_paths)} H5 files to ZIP")
+                    if self.export_progress:
+                        self.export_progress.window.destroy()
+                        self.export_progress = None
+
+                    messagebox.showinfo(
+                        "Success",
+                        f"Exported {event['count']} {event['kind']} files to ZIP",
+                    )
+                    return
+
+                elif event["type"] == "error":
+                    self.export_running = False
+
+                    if self.export_progress:
+                        self.export_progress.window.destroy()
+                        self.export_progress = None
+
+                    messagebox.showerror(
+                        "Error",
+                        f"Could not create ZIP:\n{event['error']}",
+                    )
+                    return
+
+        except queue.Empty:
+            pass
+
+        if self.export_running:
+            self.root.after(50, self.poll_export_queue)
 
     def clear_cache(self):
         if not messagebox.askyesno("Confirm", "Clear cache and results?"):
